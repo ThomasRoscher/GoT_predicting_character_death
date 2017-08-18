@@ -1,0 +1,1061 @@
+---
+title: "A Sonf of Ice and Fire"
+author: "Thomas Roscher"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: true
+    toc_depth: 4
+---
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+arrange.vars <- function(data, vars){
+    ##stop if not a data.frame (but should work for matrices as well)
+    stopifnot(is.data.frame(data))
+
+    ##sort out inputs
+    data.nms <- names(data)
+    var.nr <- length(data.nms)
+    var.nms <- names(vars)
+    var.pos <- vars
+    ##sanity checks
+    stopifnot( !any(duplicated(var.nms)), 
+               !any(duplicated(var.pos)) )
+    stopifnot( is.character(var.nms), 
+               is.numeric(var.pos) )
+    stopifnot( all(var.nms %in% data.nms) )
+    stopifnot( all(var.pos > 0), 
+               all(var.pos <= var.nr) )
+
+    ##prepare output
+    out.vec <- character(var.nr)
+    out.vec[var.pos] <- var.nms
+    out.vec[-var.pos] <- data.nms[ !(data.nms %in% var.nms) ]
+    stopifnot( length(out.vec)==var.nr )
+
+    ##re-arrange vars by position
+    data <- data[ , out.vec]
+    return(data)
+}
+
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+knitr::opts_chunk$set(cache=TRUE)
+
+```{r, message=F, warning=F, results='hide'}
+library(caret)          # for machine learning
+library(plyr)           # for function mapvalues()
+library(tidyverse)      # for data manipulation, tidying, and visualisation
+library(pdftools)       # for reading pdfs
+library(igraph)         # for network analysis
+library(zoo)            # for function rollapply()
+library(knitr)          # for function kable()
+library(stringr)        # for manipulating strings
+library(data.table)     # for function rbindlist()
+library(caretEnsemble)  # for ensemble
+```
+
+### 1. INTRODUCTION
+<p align="justify">
+I recently came across the "Network of Thrones" project where Andrew J. Beveridge, an associate professor of mathematics at Macalester College, and Jie Shan, decided to turn the book "A Song of Ice and Fire" into a social network using network science. For any readers who are neither familiar with the article (A. Beveridge & J. Shan: 2016) nor with network analysis in general here's what they did. In a nutshell, they identified all main characters who appear in the third book and scanned for interactions (measured as names appearing within 15 words of one another). Based on those interactions they then found communities and calculated influence measures for all members of the network. While I really enjoyed reading their article - probably partly because I myself did not know much about network analysis before - I also asked myself if one may use their derived insights to answer the most prominent question among fans of the merchandise: Who bites the dust? Thus, what follows is basically, an implementation of their approach for all 5 books. I then however use the generated data to train various machine learning algorithms in order to build a model that predicts a characters death as accurately as possible. 
+</p>
+
+<p align="justify">
+Note that, this project is 100% reproducible and that I provide a detailed step by step description of each process required to get to the final results including wrangling data, cleaning strings, using a self written function to extract an undirected and weighted edge-list from a given text, vizualizing data, as well as training and comparing various machine learning models.
+</p>
+
+### 2. COLLECTING DATA
+
+#### 2.1 CREATING THE BASIC DATASET 
+
+<p align="justify">
+Obviously for any data driven project, one first needs to acquire relevant data. My point of departure is a data set created by Erin Pierce and Ben Kahle. Using "A Wiki of Ice and Fire", they identified all 916 characters that appeared in the books so far. Moreover, for every character, it is stated, if they are male or female, if they are part of the nobility or not, what major house they are loyal to, which books they occured in, and, if applicable, the book of their death. Basically my plan is to extend the dataset with measures of influence and power for each character. I will explain this later on in more detail. Before I get to this part though, the first step is to tidy and adjust the data provided by Pierce and Kahle so that it is of any use for me. More, precicely I transform the data to a kind of time (or rather book) series - cross section format and create, reshape, and drop some variables. 
+</p>
+
+```{r, message=FALSE, warning=FALSE}
+# read the Pierce and Kahle dataset
+got <- read_csv("character-deaths.csv")
+
+## adjust dataset to a tidy kind of time series cross section format and add/remove some variables
+got <- got %>%
+    # create id variable
+    mutate(ID = row_number()) %>%
+    # gather GoT, CoK, SoS, FfC, DwD to factor variable book
+    gather(book, appearance, GoT, CoK, SoS, FfC, DwD, factor_key = T) %>%
+    # rename levels
+    mutate(book = factor(book, labels = c("1", "2", "3", "4", "5"))) %>%
+    # create status indicating if a character is dead or alive
+    mutate(status = ifelse(BookofDeath == 1 & book == 1, "dead", 
+                     ifelse(BookofDeath == 2 & book == 2, "dead",
+                      ifelse(BookofDeath == 3 & book == 3, "dead",
+                       ifelse(BookofDeath == 4 & book == 4, "dead",
+                        ifelse(BookofDeath == 5 & book == 5, "dead", "alive"))))))  %>%
+    mutate(status = ifelse(is.na(status), "alive", status)) %>%
+    # drop invalid character-book combinations
+    filter(appearance != 0) %>%
+    # arrange dataset by name and book
+    arrange(ID, book) %>%
+    # create a variable that counts for how many "books" the character is already alive
+    group_by(ID) %>% 
+    mutate(live_length = row_number()) %>% 
+    ungroup() %>%
+    # split the first name from name and store it as first 
+    mutate(first = gsub("([A-Za-z]+).*", "\\1", Name)) %>% 
+    # drop useless variables
+    select(ID, Name, first, book, status, Gender, Nobility, Allegiances, live_length) %>%  
+    # rename levels
+    mutate(Nobility = factor(Nobility, labels = c("common", "noble"))) %>%
+    mutate(Gender = factor(Gender, labels = c("female", "male")))
+
+# translate to lower case
+colnames(got) <- tolower(colnames(got))
+
+# take care of remaining factor variables 
+got$status <- as.factor(got$status)    
+got$allegiances <- as.factor(got$allegiances)
+got$live_length <- factor(got$live_length,  levels=c("1", "2", "3", "4", "5"), ordered=TRUE)
+
+# small function to deal with inconsistent coding in the Pierce and Kahle data set
+norm.text <- function(string){
+   string <- tolower(string)
+   string <- str_replace_all(string, "house", "")
+   string <- str_trim(string, side = c("both"))
+}
+got$allegiances <- sapply(got$allegiances, norm.text)
+got$allegiances <- as.factor(got$allegiances)
+
+# show head of data 
+kable(head(got))
+```
+
+
+#### 2.2 CREATING A WORKABLE LIST OF NAMES 
+
+<p align="justify">
+Now that I have a nice and clean starting point, I can turn to the more complex and fun part. As already mentioned, eventually I need to find all interactions (called edges in network analysis) between the characters over the course of the five books. While I already do have a complete list of names (called nodes in network analysis), there still are some issues that may be best explained with an example. Consider Petyr Baelish, also called Littlefinger. While "Petyr" can be found 51 times in book 1 "Littlefinger" shows up 157 times, "Lord Baelish" 25 times, and "Lord Petyr Baelish" 5 times (I used the command str_count() to get the numbers). Thus, it is not that simple to actually get each mention for all characters correctly because many have aliases, titles and other names. Additionally, many charcters share the same first name or last name. For, example a query to find all instances of "Jon" does capture all mentions of Jon Snow, but also returns appearances of Jon Connington or Jon Arryns. Honestly speaking, designing the queries in such a manner that there will be neither false positives nor false negatives is hardly achievable for some characters. However, using only the first name and the related nicknames seems to be a good strategy. Thus, the next step is to generate a nice and clean list of first names and major nicknames. Obviously, that forces me to drop some characters from the list because they share their first name with another character. I tried to keep the more important people in the list. I also was forced to drop some minor character that have names equal to regular words words such as "Will".
+</p>
+
+```{r, message=FALSE, warning=FALSE}
+
+## check for and remove dublicated first names
+
+# keep only distinct ids
+di <- got %>%
+    distinct(name, .keep_all = TRUE) %>%
+    arrange(id)
+
+# check for duplicates 
+dup <- which(duplicated(di$first))
+
+# remove important people from duplicates such as Jon Snow, Eddard Stark, Cersei Lannister...
+imp <- c(7, 94, 119, 131, 218, 410, 637, 703, 726, 863)
+dup <- dup[!dup %in% imp]
+
+# add the corresponding less important people to duplicates
+# also drop some characters whose first name are identiacla to other words (e.g. Will)
+dup2 <- c(5, 93, 118, 130, 217, 407, 638, 427, 704, 864, 81, 797, 896, 477, 449, 716, 727, 282, 883, 603, 375)
+dup <- c(dup, dup2)
+
+# remove duplicates from dataset 
+got <- got %>%
+    filter(!id %in% dup)
+
+# add stannis because he is for some reasons not in the dataset
+sb1 <- c(918, "Stannis Baratheon", "Stannis", 1, "alive", "male", "noble", "baratheon", 1)
+sb2 <- c(918, "Stannis Baratheon", "Stannis", 2, "alive", "male", "noble", "baratheon", 2)
+sb3 <- c(918, "Stannis Baratheon", "Stannis", 3, "alive", "male", "noble", "baratheon", 3)
+sb4 <- c(918, "Stannis Baratheon", "Stannis", 4, "alive", "male", "noble", "baratheon", 4)
+sb5 <- c(918, "Stannis Baratheon", "Stannis", 5, "alive", "male", "noble", "baratheon", 5)
+got <- do.call(rbind, list(got, sb1, sb2, sb3,sb4, sb5))
+```
+
+<p align="justify">
+Now, because there are only unique first names left. I add some mayor nicknames. Originally, I was hoping that I could scrap the names from the web (Doing thus would only require a few lines of code if the web page is programmed properly). It turned out though, that it is not possible because the relevant html nodes differ for many characters. Thus, I decided to add at least the mayor nicknames manually instead.
+</p>
+
+```{r, message=FALSE, warning=FALSE}
+got <- got  %>%
+    mutate(nicknames = "0") %>%
+    mutate(nicknames = replace(nicknames, id == 56,  "Arry")) %>% # later on 
+    mutate(nicknames = replace(nicknames, id == 87,  "Ben")) %>%
+    mutate(nicknames = replace(nicknames, id == 119, "Blackfish")) %>%
+    mutate(nicknames = replace(nicknames, id == 127, "Cat")) %>%
+    mutate(nicknames = replace(nicknames, id == 163, "Dany")) %>%
+    mutate(nicknames = replace(nicknames, id == 218, "Ned")) %>%
+    mutate(nicknames = replace(nicknames, id == 301, "Mountain")) %>%
+    mutate(nicknames = replace(nicknames, id == 383, "Kingslayer")) %>%
+    mutate(nicknames = replace(nicknames, id == 395, "Old Bear")) %>%
+    mutate(nicknames = replace(nicknames, id == 410, "Snow")) %>%
+    mutate(nicknames = replace(nicknames, id == 637, "Littlefinger")) %>%
+    mutate(nicknames = replace(nicknames, id == 641, "Pod")) %>%
+    mutate(nicknames = replace(nicknames, id == 703, "Usurper")) %>%
+    mutate(nicknames = replace(nicknames, id == 741, "Sam")) %>%
+    mutate(nicknames = replace(nicknames, id == 742, "Hound")) %>%
+    mutate(nicknames = replace(nicknames, id == 801, "Reek")) %>% # later on
+    mutate(nicknames = replace(nicknames, id == 834, "Imp")) %>%
+    mutate(nicknames = replace(nicknames, id == 855, "Spider")) 
+
+# store names and nicknames in the same vector 
+firsts <- unique(unlist(got$first))
+nicknames   <- unlist(got$nicknames)
+names       <- c(firsts, nicknames[nicknames != 0])
+```
+
+#### 2.3 CREATING THE EDGE LIST (INTERACTIONS) 
+
+<p align="justify">
+Now, since I got my adjusted character list I turn to scanning the interactions from the books. First, I read the books and clean them. That is, I collapse all the pages to a single string, remove some useless pages, remove special characters as well as redundant white space. The aim here is getting a text corpus only consisiting of words seperated by a single whitespace. If you ever worked with strings or did some text analysis (e.g Twitter messages) you propaply now that strings tend to be a messy thing at the start, though the extend here is not that bad bacause I work with books.
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+# read the book
+got1_book <- pdf_text("book1.pdf")
+got2_book <- pdf_text("book2.pdf")
+got3_book <- pdf_text("book3.pdf")
+got4_book <- pdf_text("book4.pdf")
+got5_book <- pdf_text("book5.pdf")
+
+# collapse pages
+got1_book <- paste(got1_book[10:735], collapse = '')
+got2_book <- paste(got2_book[1:267], collapse = '')
+got3_book <- paste(got3_book[17:1029], collapse = '')
+got4_book <- paste(got4_book[2:539], collapse = '')
+got5_book <- paste(got5_book[11:623], collapse = '')
+
+# create function norm.text() to clean the text corpus
+norm.text <- function(string){
+   string <- str_replace_all(string, "\r", " ")
+   string <- str_replace_all(string, "\n", " ")
+   string <- str_replace_all(string,"previous | Table of Contents | next","")
+   string <- str_replace_all(string, "[^[:alnum:]]", " ")
+   string <- str_replace_all(string, " ll ", " will ")
+   string <- str_replace_all(string, " d ", " would ")
+   string <- str_replace_all(string, "can t ", "cannot ")
+   string <- str_replace_all(string, "n t ", " not ")
+   string <- str_replace_all(string, " re ", " are ")
+   string <- str_replace_all(string, " m ", " am ")
+   string <- str_replace_all(string, " n ", " and ")
+   string <- str_replace_all(string, " s ", "")
+   string <- str_replace_all(string, "\\s+", " ")
+   string <- str_replace_all(string, " PROLOGUE", "")
+   string <- str_replace_all(string, "^CHAPTER[0-9]+$", "")
+   string <- str_trim(string, side = c("both"))
+   return(string)
+}
+
+# apply norm.text() 
+got1_book <- norm.text(got1_book)
+got2_book <- norm.text(got2_book)
+got3_book <- norm.text(got3_book)
+got4_book <- norm.text(got4_book)
+got5_book <- norm.text(got5_book)
+```
+
+<p align="justify">
+Unfortunately, there is no function in R that extracts an undirected weighted edge list from a given text. Therefore, I created an user written function that does the job. Just as a quick reminder, what I need is a list that contains the frequency of each unique interaction, defined as a co-occurrence of two names within n words. Besides, interactions are undirected, thats is, it does not matter which name shows up first. Put differently, for example, the following six interactions count as the very same: 
+</p>
+
+* "Eddard" - "Littlefinger",
+* "Littlefinger" - "Eddard"
+* "Ned" - "Littlefinger", 
+* "Eddard" - "Petyr", 
+* "Ned" - "Petyr" 
+* "Petyr" - "Ned"
+
+<p align="justify">
+So how do I get my list exactly? While there surely are many approaches for this my general procedure is that the function runs over each word of the text. If the word is a name (or nickname) of a character it checks if any other name (or nickname) occurs withing the next n words. If thats is the case the interaction is stored in a data frame. The function below takes only about a few seconds for each book (thanks to the apply function family). I guess that the function may looks a bit confusing at first sight so here what it does step by step if we for example decide n to be 20:
+</p>
+
+1. *split* a clean text corpus into single words 
+2. *merge* each word with the next 19 words 
+3. *split* the resulting strings into the first word (variable "person1") and the remaining 19 words (variable "person2")
+4. *filter* observation were "person1" is a character name 
+5. *filter* observation were "person2" contains at least one character name 
+6. because "person2" will look like c("Bran", "Robb") if more then one name is found several steps are taken to *transform* those cases to proper single interactions 
+7. *replace* nicknames with first names 
+8. *drop* cases were "person1" matches "person2"
+8. *transform* directed edge-list to weighted and undirected edge-list
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE}
+
+# create library for function mapvalues()
+# nl must include 3 variables named as follows: "id", "first", "nicknames" 
+nl <- cbind(got[1], got[3], got[10])
+
+# crete function edge_list() to create an weighted edge list from a string 
+edge_list <- function(input_text, names, nl, width = 15){
+    # split into words
+    split_input  <- unlist(str_split(input_text, " "))
+    # run "window" over text and each time paste words  
+    split_window <- as.data.frame(rollapply(split_input, width = width, function(x) paste(x)))
+    colnames(split_window)[1] <- "person1"
+    # split resulting windws into first word and rest
+    split_window <- unite(split_window, rest, 2:length(split_window), sep = " ", remove = TRUE)
+    # in "rest" look which names occur
+    split_window$person2 <- sapply(strsplit(split_window$rest, " "), function(x) intersect(x, names))
+    # filter split_window
+    split_window <- split_window %>%
+        # string starts with a name
+        filter(person1 %in% names) %>% 
+        # "rest" contains a name
+        filter(person2 != "character(0)") 
+    # deal with cases were several names occured in rest (for example c("Bran", "Robb") is shown)
+    # change pattern  c("Bran", "Robb") to Bran, Rob
+    pattern  <- "c\\(|\\)|\""
+    split_window$person2 <- str_replace_all(split_window$person2, pattern, "")
+    # give instances with several names their own observations
+    # split additional names to new variables
+    split_window <- split_window %>%
+        separate(person2, into = c("person2", "person3", "person4", "person5", "person6"))
+    # transform back to two variables
+    q <- as.data.frame(paste(split_window$person1, split_window$person2))
+    w <- as.data.frame(paste(split_window$person1, split_window$person3))
+    e <- as.data.frame(paste(split_window$person1, split_window$person4))
+    r <- as.data.frame(paste(split_window$person1, split_window$person5))
+    t <- as.data.frame(paste(split_window$person1, split_window$person6))
+    edgelist <- data.frame(rbindlist(list(q,w,e,r,t)))
+    colnames(edgelist)[1] <- "edge"
+    edgelist <- separate(edgelist, edge, into = c("person1", "person2"))
+    # filter edge list
+    edgelist <- edgelist %>%
+    filter(person1 != person2) %>%
+    filter(person2 != "NA")
+    # change nicknames to realnames 
+    edgelist$person1 <- mapvalues(edgelist$person1, nl$first, nl$id, warn_missing = TRUE)
+    edgelist$person1 <- mapvalues(edgelist$person1, nl$nicknames, nl$id, warn_missing = TRUE)
+    edgelist$person2 <- mapvalues(edgelist$person2, nl$first, nl$id, warn_missing = TRUE)
+    edgelist$person2 <- mapvalues(edgelist$person2, nl$nicknames, nl$id, warn_missing = TRUE)
+    edgelist$person1 <- mapvalues(edgelist$person1, nl$id, nl$first, warn_missing = TRUE)
+    edgelist$person2 <- mapvalues(edgelist$person2, nl$id, nl$first, warn_missing = TRUE)
+    # transform edgelist to weighted edgelist
+     edgelist <-  edgelist %>% 
+        group_by(person1, person2) %>% 
+        summarise(weight = n()) %>% 
+        filter(person1 != person2) 
+    edgelist <- as.data.frame(edgelist)
+    # transform weighted edgelist to undirected weighted edgelist
+    g <- graph_from_data_frame(edgelist, directed = TRUE)
+    g <- as.undirected(g, mode = "mutual")
+    # store edges and weights in new dataframe
+    person1  <-  get.edgelist(g)[,1]
+    person2  <-  get.edgelist(g)[,2]
+    weights  <-  E(g)$weight
+    edgelist <- as.data.frame(cbind(person1,person2,weights))
+    edgelist$weights <- as.numeric(levels(edgelist$weights))[edgelist$weights]
+    edgelist$person1 <- as.character(edgelist$person1)
+    edgelist$person2 <- as.character(edgelist$person2)
+    return(edgelist)
+}
+
+# apply function edge_list() to the cleaned books
+got1_edge_list <- edge_list(got1_book, names, nl, 20)
+got2_edge_list <- edge_list(got2_book, names, nl, 20)
+got3_edge_list <- edge_list(got3_book, names, nl, 20)
+got4_edge_list <- edge_list(got4_book, names, nl, 20)
+got5_edge_list <- edge_list(got5_book, names, nl, 20)
+```
+
+<p align="justify">
+Applying the function to the cleaned books resulted in 5 networks stored as an undirected and weighted edge-list. I thought about visualizing each network. Honestly speaking, R however is not really able to create appealing plots of large networks (I tried several packages). Therefore I only extract relevant centrality measures that are used in furtehr analysis. While I will give some brief infos  about PageRank later on, I decided not to give a detailed overview about the other indicator. I also identified communities in the network using the fastgreedy.community algorithm. Again, if you are interested behind the math of all those concepts or if you are just eager to dig deeper into the matter, read for example "Statistical Analysis of Network Data with R". 
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache = TRUE}
+# create a function that extracts measures of centrality from a given weighted edge-list
+cent_measures <- function(edgelist){
+    g <-  make_graph(t(edgelist[,c("person1" , "person2")]), directed = F)
+    E(g)$weight <- edgelist$weights
+    cl <- as.data.frame(closeness(g))
+    de <- as.data.frame(degree(g))
+    be <- as.data.frame(betweenness(g, directed = FALSE))
+    ei <- as.data.frame(eigen_centrality(g)$vector)
+    pa <- as.data.frame(page_rank(g)$vector)
+    com <- cluster_fast_greedy(g, weight = E(g)$weight)
+    com <- as.data.frame(com$membership)
+    cent <- as.data.frame(cbind(cl,de,be,ei,pa,com)) 
+    colnames(cent) <- c("closeness","degree","betweenness","eigenvector", "page_rank", "community")
+    cent$first = rownames(cent)
+    as.data.frame(cent)
+}
+
+# apply function cent_measures 
+got_cent1 <- cent_measures(got1_edge_list)
+got_cent2 <- cent_measures(got2_edge_list) 
+got_cent3 <- cent_measures(got3_edge_list) 
+got_cent4 <- cent_measures(got4_edge_list) 
+got_cent5 <- cent_measures(got5_edge_list) 
+
+# left join data sets and adjust classes and levels
+got_cent1$book = 1
+got_cent2$book = 2
+got_cent3$book = 3
+got_cent4$book = 4
+got_cent5$book = 5
+
+# give communities a unique level 
+got_cent2$community = (got_cent2$community + 11)
+got_cent3$community = (got_cent3$community + 26)
+got_cent4$community = (got_cent4$community + 44)
+got_cent5$community = (got_cent5$community + 59)
+
+# merge got_cents
+got_cent_full <- Reduce(function(x, y) merge(x, y, all = TRUE), list(got_cent1, got_cent2, got_cent3, got_cent4, got_cent5))
+
+# join to final data set
+got_cent_full$book <- as.factor(got_cent_full$book)
+got_final <- inner_join(got, got_cent_full, by = c("book", "first"))
+got_final$community <- as.factor(got_final$community)
+```
+
+<p align="justify">
+Note that I again loose some obervation because even if people show up in the books the are not neccecarily part of the network if they are not involved in any interactions. Finally, the data collection and tidying process is completed and I can turn to the actual analysis. Because it is always worthwhile to take a good hard look at ones data to get acquainted with its quirks and properties, the next step is some data exploration.  
+</p>
+
+### 3. EXPLORING THE DATA
+
+<p align="justify">
+Before I start with the data exploration, I create another variable which is based on the communities. The basic idea is to identify high risk communities were many people died with the reasoning that you are arguably more likely to push up the daisies if you are a member of the Medellin Cartel rather than a member of your local fantasy football group. 
+</p>
+
+```{r}
+# asses the dead risk in a community
+got_final <- got_final %>% 
+    # get frequencies of dead/alive across communities
+    group_by(community, status) %>%
+    summarise (n = n()) %>%
+    mutate(freq = n / sum(n)) %>%
+    filter(status == "alive") %>%
+    drop_na() %>%
+    # create risk variable
+    mutate(risk_community = ifelse(freq >= 0.95, "very low",
+                             ifelse(freq < 0.95 & freq >= 0.90, "low", 
+                              ifelse(freq < 0.90 & freq >= 0.80, "medium",
+                               ifelse(freq < 0.80 & freq >= 0.75, "high", "very high"))))) %>%
+    select(community, risk_community) %>%
+    mutate(risk_community = factor(risk_community , levels=c("very low", "low", "medium", "high", "very high"), ordered=TRUE)) %>%
+    # join with data set
+    left_join(got_final) %>%
+    ungroup() 
+
+# change position of variables
+got_final <- got_final %>% 
+    arrange.vars(c("community"= 10)) %>%
+    arrange.vars(c("risk_community"= 11)) %>%
+    arrange.vars(c("nicknames"= 4))
+```
+
+#### 3.1 UNIVARIATE DISTRIBUTIONS 
+
+<p align="justify">
+Note, that at this stage it is not required to construct fancy looking plots. Rather one wants to get a quick overview about distributions and relationships. The plots offer some interesting insights:
+</p>
+
+* the number of characters is about equal in book 1, 4, and 5
+* book 3 has especially many characters
+* about 200 people died along the way
+* there are far more men then women
+* noble and common people occur about equally often
+* the biggest three fractions are Stark, Lanister, and Night's Watch 
+* there are only few characters that appear in more then two of the five books
+* some communities are especially prone to getting annihilated
+* if your family, friends and allies get killed, better make a run
+
+```{r, fig.height=6, fig.width=7, message=FALSE, warning=FALSE, fig.align='center'}
+
+## plot distribution of factor variables  
+# prepare data for plotting 
+stack_factor <- got_final[,c(-(2:4),-10,-(13:17))]
+stack_factor <- melt(stack_factor, id="id")
+
+# plot 
+ggplot(stack_factor, aes(value)) +
+    geom_bar(fill = "steelblue", color = "white", alpha=.4 ) +
+    facet_wrap(~variable, scales="free") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.2))
+```
+</p>
+Regarding the centrality measures, all except closeness are highly skewed. Note that for all centrality measures there are missing values. The reason for this is that some character are sometimes not part of the network because there name does not co-occur with any other names. One way to minimize the amount of NAs would be to relax the set condition for an interaction.
+</p>
+
+```{r, fig.height=5, fig.width=7, message=FALSE, warning=FALSE, fig.align='center'}
+## plot distribution of numeric variables  
+# prepare data for plotting 
+stack_num <- got_final[,-(2:12)]
+stack_num <- melt(stack_num, id="id")
+
+# plot 
+ggplot(stack_num, aes(value)) +
+    geom_density(fill = "steelblue", alpha=.4) +
+    #geom_histogram(fill = "steelblue", color = "white") +
+    facet_wrap(~variable, scales="free") + 
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.2))
+```
+
+#### 3.2 BIVARIATE DISTRIBUTIONS 
+
+<p align="justify">
+Next, we take a look at the relationship between the various features and the dead or alive status of each character. Note that the code is shown only exemplary for each type of plot. 
+</p>
+
+```{r, message=FALSE, warning=FALSE}
+# plot boxplot for factor variables
+p1 <- ggplot(got_final, aes(status, closeness)) + geom_boxplot(fill = "steelblue", alpha=.4)
+
+# plot bar chart for numeric variables
+p6 <- got_final %>%
+  select(book, status) %>%
+  group_by(book, status) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = book, y = freq, fill = status)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.4) + 
+  scale_fill_manual(values=c("steelblue", "darkgrey"))
+```
+
+```{r, echo=FALSE, fig.align='center', fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+p7 <- got_final %>%
+  select(gender, status) %>%
+  group_by(gender, status) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = gender, y = freq, fill = status)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.4) + 
+  scale_fill_manual(values=c("steelblue", "darkgrey"))
+
+p8 <- got_final %>%
+  select(allegiances, status) %>%
+  group_by(allegiances, status) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = allegiances, y = freq, fill = status)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.4) + 
+  scale_fill_manual(values=c("steelblue", "darkgrey")) +
+  coord_flip()
+
+p9 <- got_final %>%
+  select(live_length, status) %>%
+  group_by(live_length, status) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = live_length, y = freq, fill = status)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.4) + 
+  scale_fill_manual(values=c("steelblue", "darkgrey"))
+
+p10 <- got_final %>%
+  select(nobility, status) %>%
+  group_by(nobility, status) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = nobility, y = freq, fill = status)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.4) + 
+  scale_fill_manual(values=c("steelblue", "darkgrey"))
+
+p11 <- got_final %>%
+  select(risk_community, status) %>%
+  group_by(risk_community, status) %>%
+  summarise (n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ggplot(aes(x = risk_community, y = freq, fill = status)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.4) + 
+  scale_fill_manual(values=c("steelblue", "darkgrey"))
+
+
+multiplot(p6, p7, p8, p9, p10, p11, cols=2)
+```
+
+<p align="justify">
+Regarding the relationship between status and the various categorical independent variables he various plots indicate that:
+</p>
+
+* far less people died in book 4
+* men die more often then women
+* being around for a while will not necessarily make you less likely to die 
+* common folk is more prone to get killed 
+* better don't be a wildling
+* among the "civilized" houses supporters of Stark and Greyjoy got killed predominately
+* if your friends and allies get killed, your risk of dying rises 
+
+<p align="justify">
+OK, how about the centrality measures? Unfortunately, the patterns are not as clear as I hoped. None of the extracted centrality measures seems to separates the living from the dead pretty clearly. I additionally, ran some bivariate logistic regressions and Mann-Whitney-Wilcoxon tests, indicating that at least PageRank may be associated with the status of the character. While I hoped for better results it is still to early to say that using the centrality measures will result in a kind of garbage-in-garbage-out model.  
+</p>
+
+```{r, echo=FALSE, fig.align='center', fig.height=6, fig.width=8, message=FALSE, warning=FALSE}
+p1 <- ggplot(got_final, aes(status, closeness)) + geom_boxplot(fill = "steelblue", alpha=.4)
+p2 <- ggplot(got_final, aes(status, log10(degree))) + geom_boxplot(fill = "steelblue", alpha=.4)
+p3 <- ggplot(got_final, aes(status, log10(betweenness))) + geom_boxplot(fill = "steelblue", alpha=.4) 
+p4 <- ggplot(got_final, aes(status, log10(eigenvector))) + geom_boxplot(fill = "steelblue", alpha=.4) 
+p5 <- ggplot(got_final, aes(status, log10(page_rank))) + geom_boxplot(fill = "steelblue", alpha=.4)
+
+multiplot(p1, p2, p3, p4, p5, cols=2)
+```
+
+### 4. EXCURS: DESCRIBING THE NETWORK BASED ON PAGE RANK
+
+<p align="justify">
+While I already said that I will not create a classic network graph, it still might be interesting to see who the major players in the book are and how there position changed over time. PageRank is not only in our case the most promising measure but arguably on of the most popular ranking algorithm as well(designed and made famous by Google founder Larry Page). Therefore, in order to illustrate some properties of the networks I focus on this indicator. But what does PageRank actually measure? Basically, there are three distinct factors that determine the PageRank of a node: (i) the number of links it receives, (ii) the link propensity of the linkers, and (iii) the centrality of the linkers. The first factor is not surprising: the more links a node attracts, the more important it is perceived. Reasonably, the value of the endorsement depreciates proportionally to the number of links given out by the endorsing node: links coming from parsimonious nodes are worthier than those emanated by spendthrift ones. Finally, not all nodes are created equal: links from important vertices are more valuable than those from obscure ones (cited from https://www.sci.unich.it/~francesc/teaching/network/pagerank).
+</p>
+<p align="justify">
+The first plot below illustrates the ten most important people according to PageRank across the five books. Besides, it is shown if the character is dead or alive. For example, one can clearly see that Tyrion is one of the most powerful characters across all books. The same holds true for Jon, except that his values are biased because of the other characters named Jon. This problem becomes especially apparent when Jon Connington shows up in book 5. Other interesting patterns include among other the extraordinarily powerful duo Jaime and Cercei in book 4, Daenerys rise, as well as Sansa's and Aryas high ranking in book 3 which frankly spoken came as a surprise. Sansa is basically a captive in King's Landing and Arya is most of the book a captive of the hound. While one may argue that Sansa's value as a Stark heir and a pawn for other player, I struggle to find a convincing explanation for her little sister.  
+</p>
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+## plotting top 10 page rank by book and character 
+# prepare dataset
+got_final %>%
+    gather(centrality_measure, value, (13:17), factor_key = TRUE) %>%
+    group_by(book, centrality_measure) %>%
+    top_n(n = 10, value) %>% 
+    arrange(book, value) %>% 
+    filter(centrality_measure == "page_rank") %>% 
+        # plot data
+        ggplot(aes(x = first, y = value)) + 
+            geom_bar(aes(fill = status), stat = "identity") + 
+            ggtitle("Most powerfull characters according to PageRank (Book1-5)") +
+            ylab("PageRank") + 
+            theme(legend.title = element_blank()) +
+            facet_grid(. ~ book, scales="free_x") + 
+            theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.2)) +
+            scale_fill_manual(values=c("steelblue", "darkgrey"))
+```
+
+<p align="justify">
+Next, one might be interested not in the single character but in the Great Houses in general. Hence, the plot below illustrates - for each House - the summed PageRank of all it's members and supporters. For example, we can observe the decline of House Stark, the rise and fall of House Lannister, the strengthening of the Targaryens, and the increasingly important role of the wildlings. 
+</p>
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+## plotting top 10 page rank by book and allegiance
+# prepare dataset
+got_final %>%
+    gather(centrality_measure, value, (13:17), factor_key = TRUE) %>%
+    filter(centrality_measure == "page_rank") %>% 
+    select(book, allegiances, value) %>% 
+    group_by(allegiances, book) %>%
+    summarise(pr = sum(value)) %>%
+    filter(allegiances != "none") %>%
+    group_by(book) %>%
+    top_n(n = 6, pr) %>%
+        # plot data
+        ggplot(aes(x = allegiances, y = pr)) + 
+            geom_bar(aes(fill = allegiances), stat = "identity") + 
+            ggtitle("Most powerfull groups according to PageRank (Book1-5)") +
+            xlab("") + 
+            ylab("PageRank") + 
+            theme(legend.title = element_blank()) +
+            facet_grid(. ~ book, scales="free_x") + 
+            theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.2)) +
+            scale_fill_brewer(palette="Set3")
+```
+
+<p align="justify">
+Lastly, we may also plot the PageRank just for a subset of people and in a different fashion compared to the plots above. The plot below shows the values for the mayor dead characters who did not die in the first book. Unfortunately, there does not seem to be a clear pattern. </p>
+
+```{r, fig.align='center', fig.height=4, fig.width=6, message=FALSE, warning=FALSE}
+# lets take a look at PageRank over time
+# prepare data 
+dead.main.characters <-c("Tywin", "Joffrey", "Catelyn", "Robb", "Renly")
+got_final %>%
+    select(first, book, status, page_rank, closeness) %>%
+    group_by(book) %>%
+    filter(first %in% dead.main.characters)  %>% 
+        # plot data 
+        ggplot(aes(x = book, 
+                   y = page_rank,
+                   group = 1)) +
+        geom_line() +
+        geom_point(size = 3) + 
+        facet_grid(first ~ .) + 
+        geom_text(aes(label=round(page_rank*100,1)), 
+                  vjust = - 0.5, 
+                  position = position_dodge(.9), 
+                  size = 3) +
+        ggtitle("PageRank of mayor dead characters") +
+        xlab("Book") + 
+        ylab("PageRank")  
+
+```
+
+### 5. MACHINE LEARNING
+
+<p align="justify">
+Honestly speaking, I'm far from an machine learning expert and my roots rather lie in inferential statistics. Basically most of the stuff I know is from Kaggle competitions, books like "Machine Learning with R" or "An Introduction to Statistical Learning", and MOOCs. So bare with me for any potential shortcomings of which I hope are not too many. Moreover, I will not describe each algorithm in detail. If you are interested in the math I recommend reading "The Elements of Statistical Learning". I rely on the R package "caret" for the next steps. Caret is basically a set of functions that attempt to streamline the process for creating predictive models. The package contains tools for:
+</p>
+
+* data splitting
+* pre-processing
+* feature selection
+* model tuning using resampling
+* variable importance estimation  
+
+#### 5.1 SPLITTING DATA
+
+<p align="justify">
+Splitting the data is essential for machine learning tasks. If I were in a data-rich situation, the best approach for model selection and model assessment is to randomly divide the dataset into three parts: a training set, a validation set, and a test set. The training set is used to fit the models; the validation set is used to estimate prediction error for model selection; the test set is used for assessment of the generalization error of the final chosen model (Hastie & Tibshirani: 2017). Due to the small sample size I rely on resampling to estimate model accuracy and avoid overfitting though. Here, the training set is split into k smaller sets. The following procedure is followed for each of the k "folds": First, a model is trained using k-1 of the folds as training data. Second, the resulting model is validated on the remaining part of the data (i.e., it is used as a test set).
+</p>
+
+```{r, message=FALSE, warning=FALSE}
+# turn to data frame because tibble and caret dont go well together
+got_final <- as.data.frame(got_final)
+
+
+# create index
+set.seed(1709)
+trainIndex <- createDataPartition(got_final$status, 
+                                  p = .90, 
+                                  list = FALSE, 
+                                  times = 1)
+# create train and test set 
+train <- got_final[ trainIndex,]
+test  <- got_final[-trainIndex,] 
+```
+
+#### 5.1 VARIABLE IMPORTANCE
+
+<p align="justify">
+Variable importance probably does not matter to much for this project because I simply do not have that many variables. It is possible to automatically select those features in the data that are most relevant for the problem you are working on. Note that feature selection is different from dimensionality reduction. Both methods seek to reduce the number of attributes in the dataset, but a dimensionality reduction method does so by creating new combinations of attributes, where as feature selection methods include and exclude attributes present in the data without changing them (http://machinelearningmastery.com). But why does one want to restrict the number of features anyways? Well, one reason is that parsimonious models are often more comprehensible the other is that it reduces calculation time. I use a Learning Vector Quantization (LVQ) model to asses the importance of each variable. For now, I won't drop anything but eventually I will check for the final model if dropping apparently unimportant variables affects the accuracy. 
+</p>
+
+<p align="justify">
+Note, that I do not include risk_community in any of the models because after thinking about it I realized that this would totally corrupt the ability to use the final model on unseen data such as book 6 because it's calculation already includes the event that I want to predict. The only thing that one could answer with such a model would be if a certain character dies if and only if one know the status of all other characters. 
+</p>
+
+```{r, message=FALSE, warning=FALSE}
+# set resampling 
+control <- trainControl(method="cv", number=10 )
+
+# train the model
+model <- train(status~., 
+               data = train[c(5:9, 11, 13:17)], 
+               method="lvq", 
+               preProcess = c("center", "scale"), 
+               trControl=control)
+
+# estimate variable importance
+importance <- varImp(model, scale = FALSE)
+```
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+# plot importance
+plot(importance)
+```
+
+#### 5.2 SPOT-CHECKING-ALGORITHMS AND PRE-PROCESSING
+
+<p align="justify">
+Obviously the first question that rises at this point is which algorithms is best to train a model on my data . Unfortunately no one method dominates all others over all possible data sets. Thus this question can only be answered by experience and trial and error. Since I lack the former I rely more on the latter. My approach here is to start with 5 rather common algorithms that are a mix of tree based, linear, and non-linear approaches that are no assemble algorithms. More precisely, I will use Logistic Regression, CART, Naive Bayes, K-Nearest-Neighbors, Support Vector Machine with Radial Basis Function Kernel, and a Neural Net. 
+</p>
+
+<p align="justify">
+When training models one also must consider any potential pre-processing of the data because many (but not all!) models expect data to be transformed before one can apply the algorithm. Other for example, expect no missing values. Generally speaking, this process involves, transformations, dealing with missing values, dimension reduction, and removing redundant features. There are quiet a few options for pre-processing that one may wants to consider though there is no single blueprint for this step. I decided to run each of the models in three different versions: with no transformation, with standardized continuous variables, and with PCA scores. 
+</p>
+
+<p align="justify">
+Next, since I at the end of the day want to assess model accuracy of various models and parameter settings, I must pick a measure. There are a vast number of different measures, including ROC, Accuracy, RMSE, and Kappa. I rely on the latter because the Kappa statistic adjusts accuracy by accounting for the possibility of a correct prediction by chance alone (which would be a value of 0). This is especially important because my dataset has severe class imbalance (Lantz: 2015). 
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE, results='hide'}
+# set resampling 
+set.seed(7)
+trainControl <- trainControl(method = "cv", 
+                             number = 10,
+                             savePredictions = TRUE, 
+                             classProbs = TRUE)
+
+# define  list of algorithms
+algorithmList <- c("glmnet", "rpart", "nb", "knn", "svmRadial", "nnet")
+
+# train models 
+set.seed(7)
+model_list_big_d1 <- caretList(
+    status~., 
+    data = train[c(5:9, 11, 13:17)],
+    trControl = trainControl,
+    metric = "Kappa",
+tuneList=list(
+    logl  = caretModelSpec(method = "glmnet", family = "binomial"),
+    logl2 = caretModelSpec(method = "glmnet", family = "binomial", preProcess = c("center", "scale")),
+    logl3 = caretModelSpec(method = "glmnet", family = "binomial", preProcess = c("center", "scale", "pca")),
+    cart  = caretModelSpec(method = "rpart"),
+    cart2 = caretModelSpec(method = "rpart", preProcess = c("center", "scale")),
+    cart3 = caretModelSpec(method = "rpart", preProcess = c("center", "scale", "pca")),
+    nb    = caretModelSpec(method = "nb"),
+    nb2   = caretModelSpec(method = "nb", preProcess = c("center", "scale")),
+    nb3   = caretModelSpec(method = "nb", preProcess = c("center", "scale", "pca")),
+    knn   = caretModelSpec(method = "knn"),
+    knn2  = caretModelSpec(method = "knn", preProcess = c("center", "scale")),
+    knn3  = caretModelSpec(method = "knn", preProcess = c("center", "scale", "pca")),
+    svm   = caretModelSpec(method = "svmRadial"),
+    svm2  = caretModelSpec(method = "svmRadial", preProcess = c("center", "scale")),
+    svm3  = caretModelSpec(method = "svmRadial", preProcess = c("center", "scale", "pca")),
+    net   = caretModelSpec(method = "nnet"),
+    net2  = caretModelSpec(method = "nnet", preProcess = c("center", "scale")),
+    net3  = caretModelSpec(method = "nnet", preProcess = c("center", "scale", "pca"))
+  )
+)    
+
+# reample and show results  
+results <- resamples(model_list_big_d1) 
+```  
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+# plot comparison of models
+dotplot(results)
+```
+
+<p align="justify">
+The plot above gives some first valuable insides regarding which models might be worth further investigating. The overall goodness of the models is somewhat disillusioning though: SVM and regression fail miserably and the other algorithms are across the board improvable to say the least. Note, that some of the pre-process options such as scaling variables when using KNN make little sense. I wanted to run the models anyways to show that pre-processing does indeed matter most of the time. Besides, it also should have become obvious by now why choosing a model based on accuracy is in my case a bad idea because my depended variable measures pretty scare events. A closer look reveals that the following three models do best:
+</p>
+
+1. KNN with standardized variables
+2. NB with PC a scores  
+3. NNET standardized variables
+
+#### 5.3 TUNING PARAMETERS
+
+<p align="justify">
+Since I got a shortlist of possible models now, the next step is further tuning parameters to get the most from each algorithm. There are two ways to tune an algorithm in the caret package, the first is by allowing the system to do it automatically using the command tunelenght(), the other is to set parameters manually by using tuneGrid(). I follow the former approach. Note, that using the command train() already tunes parameters. However, one may want to expand or specify the default number to further enhance the model. So you may ask yourself why I did not do this with the other models in the first place? The answer again is computing time. The more parameters you try the longer a model takes to train. This is for example especially true for Neural Networks (Lantz: 2015).
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE, results='hide'}
+# re-train top 3 models with extended parameter tuning
+set.seed(7)
+net2_2  <- train(status~., data = train[c(5:9, 11, 13:17)], metric = "Kappa", method ="nnet", preProcess = c("center", "scale"), tuneLength = 20, trControl = trainControl)
+
+set.seed(7)
+nb3_2  <- train(status~., data = train[c(5:9, 11, 13:17)], metric = "Kappa", method = "nb", preProcess = c("center", "scale", "pca"), tuneLength = 20, trControl = trainControl)
+
+set.seed(7)
+knn2_2  <- train(status~., data = train[c(5:9, 11, 13:17)], metric = "Kappa", method = "knn", preProcess = c("center", "scale"), tuneLength = 20, trControl = trainControl)
+
+results_top_tuned <- resamples(list(NET = net2_2, BAYES = nb3_2, KNN = knn2_2))
+```
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+dotplot(results_top_tuned)
+```
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+plot(net2_2)
+```
+
+<p align="justify">
+Seems that the Neural Network notably profited from further tuning the parameters. I added the plot above to illustrate what tuning parameters actually means. So what you basically see is the averaged Kappa (across the folds) for a vast number of combination for the two tuning parameters "weight decay" and "hidden units".The last step here is taking a closer look at the confusion matrix for the final model which is a 26-15-1 network with 421 weights. A confusion matrix is a table that categorizes predictions according to whether they match the actual value. One of the table's dimensions indicates the possible categories of predicted values, while the other dimension indicates the same for actual values (Lantz: 2015). The table shows that of all predictions 23,3 percent were wrong. As expected the error rate is much higher for dead people then for living ones. 
+</p>
+
+```{r}
+confusionMatrix(net2_2, positive = "dead")
+```
+
+#### 5.4 ENSEMBLE METHODS: BOOSTING, BAGGING, STACKING
+
+<p align="justify">
+As an alternative to increasing the performance of a single model, it is possible to combine several models to form a powerful team. The three most popular methods for combining the predictions from different models are (Brownlee 2017):
+</p>
+
+1. Bagging: Building multiple models (typically of the same type) from different subsamples of the training dataset.
+
+2. Boosting: Building multiple models (typically of the same type) each of which learns to fix the prediction errors of a prior model in the chain.
+
+3. Stacking. Building multiple models (typically of differing types) and supervisor model that learns how to best combine the predictions of the primary models.
+
+<p align="justify">
+So, I will give those approaches a shot. Note that regarding Bagging and Boosting there are many different algorithms of which I choose only Random Forest, C5.0, and Stochastic Gradient Boosting. 
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE, results='hide'}
+# bagging and boosting
+set.seed(7)
+model_list_bb <- caretList(
+    status~., 
+    data = train[c(5:9, 11, 13:17)],
+    trControl = trainControl,
+    metric = "Kappa",
+tuneList=list(
+    gbm  = caretModelSpec(method = "gbm",tuneLength = 20),
+    rf   = caretModelSpec(method = "rf", tuneLength = 20),
+    c5   = caretModelSpec(method = "C5.0", tuneLength = 20)
+ )
+)
+```
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+bb_results <- resamples(model_list_bb) 
+dotplot(bb_results)
+```
+
+<p align="justify">
+Unfortunately, none of the three models beat the Neural Network. Maybe stacking will help. When using stacking you actually can put together any model. The key idea however is that one picks high accuracy algorithms which predictions have low correlation. This would suggest that the models are skillful but in different ways, allowing a new classifier to figure out how to get the best from each model for an improved score (Brownlee: 2017). I tried KNN and the Neural Network and it turned out that their correlation is 0.57 but let's give it a try anyways. I picked a simple Logistic Regression for combining predictions. 
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache=TRUE, results='hide'}
+# stacking
+algorithmList <- c("knn", "nnet")
+set.seed(7)
+stacking <- caretList(status~., 
+                    data = train[c(5:9, 11, 13:17)], 
+                    trControl=trainControl, 
+                    methodList=algorithmList, 
+                    metric = "Kappa",
+                    preProcess = c("center", "scale"),
+                    tuneLength = 20)
+
+stacking_results <- resamples(stacking)
+modelCor(stacking_results)
+
+set.seed(7)
+stack.rf <- caretStack(stacking, 
+                       method = "glm", 
+                       metric = "Kappa", 
+                       trControl = trainControl(
+                           method ="cv",
+                           number =10,
+                           savePredictions="final",
+                           classProbs=TRUE),
+                       tuneLength = 20)
+
+```
+
+```{r}
+stack.rf
+```
+
+<p align="justify">
+Well, frankly I don't know here why staking makes the results so much worse. They should remain at least somewhat equal. Unfortunately, caretStack() is the only function I know of and apparently even Pythons scikit-learn librarya does not support stacking as far as I know. I leave that as it is for now. Maybe I will write some code to do it manually later on. 
+</p>
+
+#### 5.5 PREDICTING ON THE TEST DATA
+
+<p align="justify">
+The last step that remains is to assess the generalization error of my final chosen model (standardized Neural Net). I know that the test data is rather small, yet as long as the sixth book is not published that is basically the only option I got. And be assured that I will test the model on the new book to give each character a dead probability before actually reading it! 
+</p>
+
+```{r}
+# estimate skill on validation dataset
+set.seed(7)
+# predict.train applies the same pre-processing as used in train 
+predictions <- predict.train(net2_2, newdata = test[c(5:9, 11, 13:17)])
+# create matrix of real values in test data and predicted values
+confusionMatrix(predictions, test$status, positive = "dead" )
+```
+
+<p align="justify">
+Indicated by sensitivity we see that the proportion of dead people that are correctly identified as such (true positives) is 39 percent which is about as good as I expected. 
+</p>
+
+### 6. SUMMARY AND OUTLOOK
+
+<p align="justify">
+Well, I hope I was able to demonstrate how many steps are required for the attempt to predict the dead of a fictional character. Ranging from actually creating features from scratch, preparing and visualizing data and eventually train various models. So were do we go from here? Since, the results aren't that overwhelming I probably will try to improve things further. Though, I'm not sure yet, how. I don't think that using a different algorithm is not to promising. I could try to get more data through further disaggregating the books into their chapters. While this obviously won't increase the number of dead guys it may help to more accurately describe the position within the network of each character over time. Apart from that including completely new features may help also.
+</p>
+
+<p align="justify">
+Please feel free to e-mail me for any question, suggestions for improvements or any similar stuff. I think code should always be shared so that other people may learn not only from your work but also from your mistakes.
+</p>
+
+<p align="justify">
+troscher86@gmail.com
+</p>
+### 7. APPENDIX
+
+```{r, message=F, warning=F, results='hide'}
+# function to arrange variables 
+arrange.vars <- function(data, vars){
+    ##stop if not a data.frame (but should work for matrices as well)
+    stopifnot(is.data.frame(data))
+
+    ##sort out inputs
+    data.nms <- names(data)
+    var.nr <- length(data.nms)
+    var.nms <- names(vars)
+    var.pos <- vars
+    ##sanity checks
+    stopifnot( !any(duplicated(var.nms)), 
+               !any(duplicated(var.pos)) )
+    stopifnot( is.character(var.nms), 
+               is.numeric(var.pos) )
+    stopifnot( all(var.nms %in% data.nms) )
+    stopifnot( all(var.pos > 0), 
+               all(var.pos <= var.nr) )
+
+    ##prepare output
+    out.vec <- character(var.nr)
+    out.vec[var.pos] <- var.nms
+    out.vec[-var.pos] <- data.nms[ !(data.nms %in% var.nms) ]
+    stopifnot( length(out.vec)==var.nr )
+
+    ##re-arrange vars by position
+    data <- data[ , out.vec]
+    return(data)
+}
+
+# function for multiple plots
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```{undefinedmessage=FALSE, warning=FALSE}
+
