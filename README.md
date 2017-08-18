@@ -1,3 +1,5 @@
+# Please use the following link for a readable rendered html
+
 https://htmlpreview.github.io/?https://github.com/ThomasRoscher/GoT_predicting_character_death_R/blob/master/sif2.html
 
 # GoT_predicting_character_death
